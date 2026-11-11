@@ -13,13 +13,14 @@ It works with the **free version** of Resolve and with **Studio**. It is an
 
 | | Resolve **free** | Resolve **Studio** |
 |---|---|---|
-| Tools that control Resolve | `legacy__` (29 tools) | `resolve__` (37 tools), `legacy__` as a backup |
+| Tools that control Resolve | `edit__` (9) and `legacy__` (29) | `resolve__` (37), plus `edit__` and `legacy__` through the bridge |
 | One-time Resolve setting | None | Preferences > General > External scripting using > **Local** |
-| Each time you open Resolve | Run one line in the Console ([step 4](#4-free-version-start-the-bridge)) | Nothing |
+| Each time you open Resolve | Run one line in the Console ([step 3](#3-free-version-start-the-bridge)) | Nothing |
 | `media__` tools (5) | Yes | Yes |
 
-Blackmagic limits outside control of Resolve to Studio. On the free version, `resolve__` tools are listed but
-answer `SCRIPTING_UNAVAILABLE`. That is expected: use the `legacy__` tools, which run from inside Resolve.
+Blackmagic limits outside control of Resolve to Studio. On the free version the server detects this and shows only
+the 3 `resolve__` tools that work without it (`knowledge`, `media_analysis`, `setup`). Studio users who start
+Claude before Resolve should install with `-Studio` so all 37 always appear.
 
 ## What you need
 
@@ -47,20 +48,20 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\setup.ps1
 ```
 
-This takes a few minutes. It downloads a pinned version of the upstream engine into `vendor\`, installs its
-Python packages there, and copies `resolve_bridge.lua` into Resolve's scripts folder (backing up any older copy).
+This takes a few minutes. It downloads a pinned version of the upstream engine into `vendor\`, copies
+`resolve_bridge.lua` into Resolve's scripts folder (backing up any older copy), registers the server with Claude
+Code if it's installed, and finishes with a health check. Before the bridge is started, that check says
+`bridge: not running`, which is expected.
 
-Near the end you may see `the scripting bridge returned no connection`. On the free version that is normal.
+| Option | Use it when |
+|---|---|
+| `.\setup.ps1 -Lite` | You have free Resolve and want a small, fast install without the upstream engine |
+| `.\setup.ps1 -Studio` | You have Studio |
+| `.\setup.ps1 -WithTranscription` | You want captions from speech (installs `faster-whisper`) |
+| `.\setup.ps1 -NoRegister` | You don't want it registered with Claude Code |
 
-### 3. Connect it to Claude
-
-**Claude Code**, from inside the project folder:
-
-```powershell
-claude mcp add --scope user resolve-creative-editor -- python -X utf8 "$PWD\unified_server.py"
-```
-
-**Claude Desktop** (Settings > Developer > Edit Config) or other clients, using your real path:
+**Claude Desktop** (Settings > Developer > Edit Config) or other clients need this added by hand, using your real
+path:
 
 ```json
 {
@@ -76,7 +77,7 @@ claude mcp add --scope user resolve-creative-editor -- python -X utf8 "$PWD\unif
 Register only this one server. If you have another Resolve MCP server set up, remove it so two tools don't
 control the same timeline. Then restart your client.
 
-### 4. Free version: start the bridge
+### 3. Free version: start the bridge
 
 Do this **each time you open Resolve**. Studio users can skip it.
 
@@ -91,7 +92,7 @@ dofile(os.getenv("APPDATA").."\\Blackmagic Design\\DaVinci Resolve\\Support\\Fus
 You should see `resolve_bridge: running`. Leave Resolve open. Running the line again restarts the bridge.
 Use the Console, because the Workspace > Scripts menu may not start it.
 
-### 5. Try it
+### 4. Try it
 
 Ask Claude:
 
@@ -106,6 +107,10 @@ If it answers with your project and timeline name, you're connected.
 - "Add a green marker at every silence longer than one second in interview.mp4."
 - "Make a contact sheet of drone.mp4 so you can pick the best shots."
 - "Show me the frame at 01:00:10:00."
+- "Check this timeline for gaps and clips I used twice."
+- "Back up this timeline, then trim 10 frames off the clip at 00:00:42."
+- "Add captions from interview.mp4." (needs `-WithTranscription`)
+- "Put markers on the beats of song.wav."
 - "Render this timeline to D:\Exports with the YouTube 1080p preset."
 
 Tip: ask Claude to work on a **duplicate timeline**, and save your project before big changes.
@@ -116,7 +121,8 @@ Names start with the group they belong to.
 
 | Group | What it does | Tools |
 |---|---|---|
-| `resolve__` | Full engine, **Studio only** | 37 grouped tools: project, media pool, timeline, markers, color, Fusion, render and more |
+| `edit__` | Safe high-level editing, works on free | `doctor`, `timeline_report`, `snapshot_timeline`, `move_item`, `trim_item`, `add_audio_markers`, `add_captions`, `export_srt`, `audit_log` |
+| `resolve__` | Full engine, **Studio only** except `knowledge`, `media_analysis`, `setup` | 37 grouped tools: project, media pool, timeline, markers, color, Fusion, render and more |
 | `legacy__` project | Works on free | `get_state`, `list_timelines`, `set_current_timeline`, `open_page`, `save_project` |
 | `legacy__` media | | `list_media`, `import_media` |
 | `legacy__` timeline | | `create_timeline`, `duplicate_timeline`, `add_track`, `append_clips`, `list_timeline_items`, `set_item_properties`, `delete_items` |
@@ -132,10 +138,18 @@ Names start with the group they belong to.
 python -m pip install faster-whisper
 ```
 
+## Built-in safety
+
+- `edit__` tools check first, act, then read the timeline back and report whether the change really happened.
+- `move_item`, `trim_item`, `delete_items` and `start_render` are refused without `confirm=true`, so Claude has to ask.
+- If a move or trim fails halfway, the clip is put back.
+- Every change is recorded in `%USERPROFILE%\resolve-claude-bridge\audit.jsonl` (see `edit__audit_log`).
+
 ## Limits on the free version
 
-- There is no razor or direct move. Claude cuts by placing part of a clip (`end_frame` is exclusive), and moves
-  by deleting and placing it again.
+- There is no razor or direct move. `move_item` and `trim_item` delete a clip and place it again, so any zoom,
+  crop or grade on that one clip resets. Back up first.
+- Beat markers are onset estimates from audio energy. They suit percussive music best.
 - No transitions, keyframes or power windows through scripting. Grading is CDL values or `.cube` LUTs on a node.
 - Claude can't hear audio. Transcripts and silence detection are measurements, so listen before final cuts.
 - Each bridge call rewrites Resolve's `Fusion.prefs`, which is fine for normal editing but not thousands of calls.
@@ -144,9 +158,9 @@ python -m pip install faster-whisper
 
 | Problem | Fix |
 |---|---|
-| `Bridge not running` | Repeat [step 4](#4-free-version-start-the-bridge). The bridge stops when Resolve closes. |
+| `Bridge not running` | Repeat [step 3](#3-free-version-start-the-bridge). The bridge stops when Resolve closes. |
 | `SCRIPTING_UNAVAILABLE` from `resolve__` tools | On free, use `legacy__` tools. On Studio, set External scripting to Local and restart Resolve. |
-| `resolve_bridge` isn't in the Scripts menu, or does nothing | Use the Console line in step 4. |
+| `resolve_bridge` isn't in the Scripts menu, or does nothing | Use the Console line in step 3. |
 | Server won't connect, `Run setup.ps1 first` | Run setup again, then run `python unified_server.py --doctor`. All `_exists` values should be `true`. |
 | `ffprobe was not found` | Install FFmpeg, add it to PATH, restart your client. |
 | `python` isn't recognized | Reinstall Python with "Add to PATH" ticked. |
@@ -157,7 +171,8 @@ python -m pip install faster-whisper
 ```
 Claude ──> unified_server.py ─┬─> resolve__  upstream engine ──> Resolve Studio
                               ├─> legacy__   mcp_server.py ──files──> resolve_bridge.lua (inside Resolve)
-                              └─> media__    FFmpeg / faster-whisper
+                              ├─> media__    FFmpeg / faster-whisper
+                              └─> edit__     checks + legacy bridge + read-back
 ```
 
 The legacy bridge opens no network port and has no "run any code" tool, only a fixed list of operations.

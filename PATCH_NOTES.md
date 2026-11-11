@@ -39,3 +39,9 @@ Do not claim the AI listened to a file unless an audio-capable model or human ac
 - Added SHA-256 + model + language keyed transcription caching; source media remains read-only.
 - Added Windows setup that pins the upstream repository revision, installs its dependencies without registering a second MCP, copies the Lua bridge with backup, and writes one `.mcp.json` entry.
 - Gateway routing tested against fake MCP child processes. Live Resolve validation is still required.
+
+## Editor upgrade (2026-11-11)
+- Added `editor_tools.py`: `edit__` tools with pre-checks, read-back verification, rollback and an audit log. The result envelope idea comes from upstream.
+- Gateway keeps running if the upstream engine is missing, hides upstream tools that cannot work on free Resolve, and sends agent instructions at startup.
+- `delete_items` and `start_render` now need `confirm=true`.
+- Setup registers the server itself and adds `-Lite`, `-Studio`, `-WithTranscription` and `-NoRegister`.

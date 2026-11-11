@@ -5,6 +5,7 @@ Tool namespaces:
   resolve__* -> upstream compound Resolve MCP
   legacy__*  -> original Lua bridge MCP
   media__*   -> original FFmpeg/transcription/contact-sheet tools (run in this process)
+  edit__*    -> verified high-level editing tools built on the bridge (run in this process)
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -22,6 +24,18 @@ UPSTREAM_REPO = pathlib.Path(os.environ.get("RESOLVE_MCP_REPO", ROOT / "vendor" 
 UPSTREAM_SERVER = pathlib.Path(os.environ.get("RESOLVE_MCP_SERVER", UPSTREAM_REPO / "src" / "server.py")).resolve()
 LEGACY_SERVER = ROOT / "mcp_server.py"
 PINNED_COMMIT = "8f9e488a1be0d1bd8be418cc4243b695781061cd"
+# Upstream tools that work without a live scripting connection, so they stay useful on free Resolve.
+OFFLINE_UPSTREAM = {"knowledge", "media_analysis", "setup"}
+# Legacy tools that destroy work or start long jobs need an explicit confirm=true.
+GUARDED_LEGACY = {"delete_items", "start_render"}
+READ_ONLY_LEGACY = {"get_state", "list_timelines", "list_media", "list_timeline_items", "list_markers", "probe_color",
+                    "export_frame", "list_render_presets", "render_status", "goto_timecode", "open_page",
+                    "set_current_timeline"}
+INSTRUCTIONS = """Controls DaVinci Resolve. On free Resolve use legacy__ and edit__ tools; resolve__ timeline tools need Studio.
+Before editing: run edit__timeline_report, since the user may have edited by hand, and edit__snapshot_timeline.
+Make small targeted changes and never rebuild a whole timeline. Ask before deleting or replacing clips.
+Never render unless the user says to. Do not mix legacy__ and resolve__ edits on one timeline.
+Read resolve__knowledge for editorial, colour and audio guidance. You cannot hear audio: say so rather than implying it."""
 
 class Child:
     def __init__(self, label: str, command: list[str], cwd: pathlib.Path):
@@ -80,13 +94,14 @@ class Child:
             assert self.proc.stdin is not None
             self.proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
             self.proc.stdin.flush()
-            try:
-                response = self.responses.get(timeout=timeout)
-            except queue.Empty as exc:
-                raise TimeoutError(f"{self.label} timed out handling {method} after {timeout:g}s") from exc
-            if response.get("id") != request_id:
-                raise RuntimeError(f"{self.label} returned an unexpected response id")
-            return response
+            deadline = time.monotonic() + timeout
+            while True:  # discard late replies to requests that already timed out
+                try:
+                    response = self.responses.get(timeout=max(0.0, deadline - time.monotonic()))
+                except queue.Empty as exc:
+                    raise TimeoutError(f"{self.label} timed out handling {method} after {timeout:g}s") from exc
+                if response.get("id") == request_id:
+                    return response
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
         if self.proc and self.proc.poll() is None and self.proc.stdin:
@@ -121,19 +136,16 @@ def _command_from_env(name: str, default: list[str]) -> list[str]:
     return value
 
 
-def _make_children() -> tuple[Child, Child]:
-    upstream_override = os.environ.get("RESOLVE_MCP_COMMAND")
-    legacy_override = os.environ.get("LEGACY_MCP_COMMAND")
-    upstream_python = _upstream_python()
-    if not upstream_override:
-        if not UPSTREAM_SERVER.is_file():
-            raise FileNotFoundError(f"Upstream server not found: {UPSTREAM_SERVER}. Run setup.ps1 first.")
-        if not upstream_python.is_file():
-            raise FileNotFoundError(f"Upstream venv Python not found: {upstream_python}. Run setup.ps1 first.")
-    upstream_cmd = _command_from_env("RESOLVE_MCP_COMMAND", [str(upstream_python), str(UPSTREAM_SERVER)])
+def _make_children() -> tuple[Child | None, Child]:
     legacy_cmd = _command_from_env("LEGACY_MCP_COMMAND", [sys.executable, str(LEGACY_SERVER)])
-    upstream_cwd = ROOT if upstream_override else UPSTREAM_REPO
-    return Child("upstream Resolve", upstream_cmd, upstream_cwd), Child("legacy bridge", legacy_cmd, ROOT)
+    legacy = Child("legacy bridge", legacy_cmd, ROOT)
+    upstream_override = os.environ.get("RESOLVE_MCP_COMMAND")
+    upstream_python = _upstream_python()
+    if not upstream_override and not (UPSTREAM_SERVER.is_file() and upstream_python.is_file()):
+        sys.stderr.write("upstream engine not installed; continuing with legacy__, media__ and edit__\n")
+        return None, legacy
+    upstream_cmd = _command_from_env("RESOLVE_MCP_COMMAND", [str(upstream_python), str(UPSTREAM_SERVER)])
+    return Child("upstream Resolve", upstream_cmd, ROOT if upstream_override else UPSTREAM_REPO), legacy
 
 
 def _prefix_tool(tool: dict[str, Any], prefix: str, warning: str = "") -> dict[str, Any]:
@@ -149,6 +161,29 @@ def _media_tools() -> list[dict[str, Any]]:
     from mcp_server import TOOLS
     names = {"probe_media", "extract_audio", "detect_silence", "transcribe_audio", "make_contact_sheet"}
     return [_prefix_tool(t, "media__", "Local media analysis; source files are read-only.") for t in TOOLS if t["name"] in names]
+
+
+def _edit_tools() -> list[dict[str, Any]]:
+    import editor_tools
+    return [_prefix_tool(t, "edit__") for t in editor_tools.TOOLS]
+
+
+def _run_edit_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    import editor_tools
+    try:
+        result = editor_tools.run(name, args)
+        return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=1)}],
+                "isError": result.get("_operation", {}).get("status") == "failed"}
+    except Exception as exc:
+        return {"isError": True, "content": [{"type": "text", "text": f"{type(exc).__name__}: {exc}"}]}
+
+
+def _with_confirm(tool: dict[str, Any]) -> dict[str, Any]:
+    schema = dict(tool.get("inputSchema") or {"type": "object", "properties": {}})
+    schema["properties"] = {**schema.get("properties", {}),
+                            "confirm": {"type": "boolean", "description": "Must be true. Ask the user first."}}
+    schema["required"] = list(schema.get("required", [])) + ["confirm"]
+    return {**tool, "inputSchema": schema}
 
 
 def _run_media_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -172,36 +207,75 @@ class Gateway:
         self.tool_routes: dict[str, tuple[str, str]] = {}
         self.started = False
         self.protocol = "2025-03-26"
+        self.upstream_mode = "offline"
+
+    def _start_child(self, child: Child | None, protocol: str) -> Child | None:
+        if child is None:
+            return None
+        try:
+            child.start(protocol)
+            return child
+        except Exception as exc:
+            sys.stderr.write(f"{child.label} failed to start: {exc}\n")
+            child.close()
+            return None
+
+    def _detect_upstream_mode(self) -> str:
+        """all = every resolve__ tool; offline = only those that work without scripting. Never launches Resolve."""
+        forced = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--upstream-tools=")),
+                      os.environ.get("RCE_UPSTREAM_TOOLS", "auto"))
+        if forced in {"all", "offline"} or not self.resolve:
+            return forced if self.resolve else "offline"
+        def ask(action: str) -> dict[str, Any]:
+            return self.resolve.request("tools/call", {"name": "resolve_control", "arguments": {"action": action}},
+                                        timeout=30.0).get("result", {})
+        try:
+            first = ask("runtime_mode")
+            try:
+                if json.loads(first["content"][0]["text"]).get("running") is False:
+                    return "offline"  # get_version could launch Resolve
+            except (KeyError, IndexError, TypeError, ValueError):
+                pass
+            return "offline" if ask("get_version").get("isError") else "all"
+        except Exception:
+            return "offline"
 
     def start(self, protocol: str) -> None:
         if self.started:
             return
         self.protocol = protocol
         self.resolve, self.legacy = _make_children()
-        self.resolve.start(protocol)
-        self.legacy.start(protocol)
+        self.resolve = self._start_child(self.resolve, protocol)
+        self.legacy = self._start_child(self.legacy, protocol)
+        self.upstream_mode = self._detect_upstream_mode()
         self.started = True
 
     def tools_list(self) -> dict[str, Any]:
-        assert self.resolve and self.legacy
         tools: list[dict[str, Any]] = []
         self.tool_routes.clear()
-        for tool in self.resolve.tools:
+        for tool in (self.resolve.tools if self.resolve else []):
+            if self.upstream_mode == "offline" and tool["name"] not in OFFLINE_UPSTREAM:
+                continue
             t = _prefix_tool(tool, "resolve__")
             tools.append(t)
             self.tool_routes[t["name"]] = ("resolve", tool["name"])
-        for tool in self.legacy.tools:
+        for tool in (self.legacy.tools if self.legacy else []):
             if tool["name"] in {"probe_media", "extract_audio", "detect_silence", "transcribe_audio", "make_contact_sheet"}:
                 continue
             t = _prefix_tool(
                 tool, "legacy__",
                 "FALLBACK ONLY: prefer the matching resolve__ tool. Do not mix legacy__ and resolve__ timeline mutations in one edit."
             )
+            if tool["name"] in GUARDED_LEGACY:
+                t = _with_confirm(t)
             tools.append(t)
             self.tool_routes[t["name"]] = ("legacy", tool["name"])
         for tool in _media_tools():
             tools.append(tool)
             self.tool_routes[tool["name"]] = ("media", tool["name"].replace("media__", ""))
+        for tool in _edit_tools():
+            tools.append(tool)
+            self.tool_routes[tool["name"]] = ("edit", tool["name"].replace("edit__", ""))
         return {"tools": tools}
 
     def handle(self, msg: dict[str, Any]) -> dict[str, Any] | None:
@@ -216,6 +290,7 @@ class Gateway:
             caps["tools"] = {}
             return {"protocolVersion": (upstream or {}).get("protocolVersion", requested),
                     "capabilities": caps,
+                    "instructions": INSTRUCTIONS,
                     "serverInfo": {"name": "resolve-creative-editor", "version": "1.0.0"}}
         if method == "notifications/initialized":
             # Child servers receive their own initialized notification during startup.
@@ -239,13 +314,29 @@ class Gateway:
             backend, original = route
             if backend == "media":
                 return _run_media_tool(original, args)
+            if backend == "edit":
+                return _run_edit_tool(original, args)
+            if backend == "legacy" and original in GUARDED_LEGACY:
+                if args.get("confirm") is not True:
+                    return {"isError": True, "content": [{"type": "text", "text":
+                            f"Blocked: {original} needs confirm=true. Ask the user first."}]}
+                args = {k: v for k, v in args.items() if k != "confirm"}
             child = self.resolve if backend == "resolve" else self.legacy
-            response = child.request("tools/call", {"name": original, "arguments": args}, timeout=1800.0)  # type: ignore[union-attr]
+            if child is None:
+                return {"isError": True, "content": [{"type": "text", "text": f"The {backend} backend is not available."}]}
+            response = child.request("tools/call", {"name": original, "arguments": args}, timeout=1800.0)
             if "error" in response:
                 return {"isError": True, "content": [{"type": "text", "text": str(response["error"])}]}
-            return response.get("result", {})
+            result = response.get("result", {})
+            if backend == "legacy" and original not in READ_ONLY_LEGACY:
+                import editor_tools
+                editor_tools.log_audit(name, args, "failed" if result.get("isError") else "success")
+            return result
         if method in {"resources/list", "resources/read", "prompts/list", "prompts/get"}:
-            assert self.resolve
+            if not self.resolve:
+                if method.endswith("/list"):
+                    return {method.split("/")[0]: []}
+                return {"_rpc_error": {"code": -32601, "message": "upstream not installed"}}
             response = self.resolve.request(method, params)
             if "error" in response:
                 return {"_rpc_error": response["error"]}
@@ -260,7 +351,9 @@ class Gateway:
 def main() -> None:
     if "--doctor" in sys.argv:
         py = _upstream_python()
+        import editor_tools
         print(json.dumps({
+            **editor_tools.doctor(),
             "upstream_repo": str(UPSTREAM_REPO),
             "upstream_server_exists": UPSTREAM_SERVER.is_file(),
             "upstream_python": str(py),

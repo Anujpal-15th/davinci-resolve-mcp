@@ -5,6 +5,8 @@
 - `resolve__*` is the primary engine.
 - `legacy__*` is a compatibility fallback only.
 - `media__*` provides local media analysis.
+- `edit__*` provides checked, read-back editing built on the bridge. Prefer it over raw `legacy__` calls.
+- On free Resolve only `resolve__knowledge`, `resolve__media_analysis` and `resolve__setup` are exposed.
 - Never mix `resolve__` and `legacy__` timeline mutations in one operation.
 
 ## Editing workflow

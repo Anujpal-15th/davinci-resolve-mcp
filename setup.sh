@@ -14,7 +14,9 @@ fi
 git -C "$VENDOR" fetch --depth 1 origin "$COMMIT"
 git -C "$VENDOR" checkout --detach FETCH_HEAD
 (cd "$VENDOR" && "$PYTHON" install.py --clients manual)
-cp "$ROOT/resolve_bridge.lua" "$HOME/resolve_bridge.lua"
+if [[ "$(uname)" == Darwin ]]; then UTIL="$HOME/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"; else UTIL="$HOME/.local/share/DaVinciResolve/Fusion/Scripts/Utility"; fi
+mkdir -p "$UTIL" && cp "$ROOT/resolve_bridge.lua" "$UTIL/"
+echo "Note: the legacy bridge is only tested on Windows. Studio users should use the resolve__ tools."
 cat > "$ROOT/.mcp.json" <<EOF
 {
   "mcpServers": {
