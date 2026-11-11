@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "resolve-creative-editor": {
+      "command": "python",
+      "args": [
+        "unified_server.py"
+      ],
+      "env": {
+        "RESOLVE_MCP_REPO": "C:\\\\path\\\\to\\\\Resolve-Creative-Editor\\\\vendor\\\\davinci-resolve-mcp",
+        "RESOLVE_MCP_PYTHON": "C:\\\\path\\\\to\\\\vendor\\\\davinci-resolve-mcp\\\\venv\\\\Scripts\\\\python.exe",
+        "RESOLVE_MCP_SERVER": "C:\\\\path\\\\to\\\\vendor\\\\davinci-resolve-mcp\\\\src\\\\server.py",
+        "PYTHONUTF8": "1"
+      }
+    }
+  }
+}

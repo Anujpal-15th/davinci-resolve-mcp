@@ -1,5 +1,12 @@
 __pycache__/
-*.pyc
-.claude/
-graphify-out/
+*.py[cod]
+.venv/
+venv/
+vendor/
+logs/
+analysis/
+scratch/
 *.tmp
+.mcp.json
+
+.mcp.json.setup-generated

@@ -44,9 +44,23 @@ do
   local function skip(s, i) return s:find("%S", i) or #s + 1 end
   local esc = { ['"'] = '"', ['\\'] = '\\', ['/'] = '/', b = '\b', f = '\f', n = '\n', r = '\r', t = '\t' }
   local function utf8char(cp)
-    if cp < 0x80 then return string.char(cp)
-    elseif cp < 0x800 then return string.char(0xC0 + math.floor(cp / 64), 0x80 + cp % 64)
-    else return string.char(0xE0 + math.floor(cp / 4096), 0x80 + math.floor(cp / 64) % 64, 0x80 + cp % 64) end
+    assert(cp and cp >= 0 and cp <= 0x10FFFF, "invalid unicode code point")
+    if cp < 0x80 then
+      return string.char(cp)
+    elseif cp < 0x800 then
+      return string.char(0xC0 + math.floor(cp / 64), 0x80 + cp % 64)
+    elseif cp < 0x10000 then
+      return string.char(0xE0 + math.floor(cp / 4096), 0x80 + math.floor(cp / 64) % 64, 0x80 + cp % 64)
+    end
+    return string.char(0xF0 + math.floor(cp / 262144),
+      0x80 + math.floor(cp / 4096) % 64,
+      0x80 + math.floor(cp / 64) % 64,
+      0x80 + cp % 64)
+  end
+  local function read_hex4(s, i)
+    local hex = s:sub(i, i + 3)
+    assert(#hex == 4 and hex:match("^%x%x%x%x$"), "invalid unicode escape")
+    return tonumber(hex, 16)
   end
   local function dstring(s, i)
     assert(s:sub(i, i) == '"', "expected string")
@@ -57,9 +71,28 @@ do
       assert(c ~= "", "unterminated string")
       if c == "\\" then
         local n = s:sub(j + 1, j + 1)
-        if n == "u" then out[#out + 1] = utf8char(tonumber(s:sub(j + 2, j + 5), 16)); j = j + 6
-        else out[#out + 1] = assert(esc[n], "bad escape"); j = j + 2 end
-      else out[#out + 1] = c; j = j + 1 end
+        if n == "u" then
+          local cp = read_hex4(s, j + 2)
+          j = j + 6
+          if cp >= 0xD800 and cp <= 0xDBFF then
+            assert(s:sub(j, j + 1) == "\\u", "missing low surrogate")
+            local low = read_hex4(s, j + 2)
+            assert(low >= 0xDC00 and low <= 0xDFFF, "invalid low surrogate")
+            cp = 0x10000 + (cp - 0xD800) * 0x400 + (low - 0xDC00)
+            j = j + 6
+          else
+            assert(not (cp >= 0xDC00 and cp <= 0xDFFF), "unexpected low surrogate")
+          end
+          out[#out + 1] = utf8char(cp)
+        else
+          out[#out + 1] = assert(esc[n], "bad escape")
+          j = j + 2
+        end
+      else
+        assert(string.byte(c) >= 0x20, "unescaped control character")
+        out[#out + 1] = c
+        j = j + 1
+      end
     end
   end
   local function dvalue(s, i)
@@ -271,19 +304,62 @@ function OPS.create_timeline(a)
 end
 
 function OPS.append_clips(a)
+  if type(a.clips) ~= "table" or #a.clips == 0 then
+    error("clips must be a non-empty array", 0)
+  end
   local list = {}
-  for _, spec in ipairs(a.clips) do
+  for index, spec in ipairs(a.clips) do
+    if type(spec) ~= "table" or type(spec.clip) ~= "string" or spec.clip == "" then
+      error("clips[" .. index .. "].clip must be a non-empty media id or exact name", 0)
+    end
     local c = find_clip(spec.clip)
-    local finish = spec.end_frame
-    if finish == nil then finish = math.floor(tonumber((c:GetClipProperty() or {})["Frames"]) or 1) - 1 end
-    local d = { mediaPoolItem = c, startFrame = spec.start_frame or 0, endFrame = finish }
-    if spec.track_index then d.trackIndex = spec.track_index end
-    if spec.record_frame then d.recordFrame = spec.record_frame end
-    if spec.media_type then d.mediaType = spec.media_type end
+    local props = c:GetClipProperty() or {}
+    local total_frames = tonumber(props["Frames"])
+    local first = tonumber(spec.start_frame or 0)
+    local finish = tonumber(spec.end_frame)
+    if first == nil or first < 0 or first ~= math.floor(first) then
+      error("clips[" .. index .. "].start_frame must be a non-negative integer", 0)
+    end
+    if finish == nil then
+      if not total_frames or total_frames < 1 then
+        error("cannot infer source duration for " .. spec.clip .. "; provide end_frame", 0)
+      end
+      finish = math.floor(total_frames)
+    end
+    if finish <= first or finish ~= math.floor(finish) then
+      error("clips[" .. index .. "].end_frame is an exclusive bound and must be an integer > start_frame", 0)
+    end
+    if total_frames and finish > total_frames then
+      error("clips[" .. index .. "] exclusive end_frame exceeds source duration (" .. total_frames .. " frames)", 0)
+    end
+    local d = { mediaPoolItem = c, startFrame = first, endFrame = finish }
+    if spec.track_index ~= nil then
+      local track = tonumber(spec.track_index)
+      if not track or track < 1 or track ~= math.floor(track) then
+        error("clips[" .. index .. "].track_index must be a positive integer", 0)
+      end
+      d.trackIndex = track
+    end
+    if spec.record_frame ~= nil then
+      local record = tonumber(spec.record_frame)
+      if not record or record < 0 or record ~= math.floor(record) then
+        error("clips[" .. index .. "].record_frame must be a non-negative integer", 0)
+      end
+      d.recordFrame = record
+    end
+    if spec.media_type ~= nil then
+      local media_type = tonumber(spec.media_type)
+      if media_type ~= 1 and media_type ~= 2 then
+        error("clips[" .. index .. "].media_type must be 1 (video only) or 2 (audio only)", 0)
+      end
+      d.mediaType = media_type
+    end
     list[#list + 1] = d
   end
+  local appended = pool():AppendToTimeline(list)
+  if not appended then error("Resolve AppendToTimeline returned no result", 0) end
   local out = {}
-  for _, it in ipairs(each(pool():AppendToTimeline(list))) do out[#out + 1] = item_info(it) end
+  for _, it in ipairs(each(appended)) do out[#out + 1] = item_info(it) end
   return out
 end
 
@@ -297,7 +373,12 @@ function OPS.add_track(a)
   local kind = a.track_type or "audio"
   if kind ~= "audio" and kind ~= "video" then error("track_type must be audio or video", 0) end
   local t = tl()
-  local ok = (kind == "audio") and t:AddTrack("audio", "stereo") or t:AddTrack("video")
+  local ok
+  if kind == "audio" then
+    ok = t:AddTrack("audio", "stereo")
+  else
+    ok = t:AddTrack("video")
+  end
   return { ok = ok and true or false, count = t:GetTrackCount(kind) }
 end
 
@@ -362,6 +443,91 @@ function OPS.delete_items(a)
   local list = {}
   for _, id in ipairs(a.item_ids) do list[#list + 1] = find_item(id) end
   return { ok = tl():DeleteClips(list, a.ripple or false) and true or false }
+end
+
+local function text_tool(it)
+  local comp = it:GetFusionCompByIndex(1)
+  local tool = comp and comp:FindToolByID("TextPlus")
+  if not tool then
+    for _, x in pairs(comp and comp:GetToolList(false) or {}) do
+      if x.ID == "TextPlus" then tool = x end
+    end
+  end
+  if not tool then error("no Text+ tool in this title", 0) end
+  return tool
+end
+
+-- Font/size/position plus other Text+ inputs by id. Enabled* first: an element's inputs don't exist until it is on.
+local function apply_text_style(tool, a)
+  if a.font then tool:SetInput("Font", a.font) end
+  if a.style then tool:SetInput("Style", a.style) end
+  if a.size then tool:SetInput("Size", a.size) end
+  if a.y then tool:SetInput("Center", { a.x or 0.5, a.y }) end
+  local keys = {}
+  for k, v in pairs(a.inputs or {}) do
+    if type(k) == "string" and k:match("^%a+%d?$") and type(v) == "number" then keys[#keys + 1] = k end
+  end
+  table.sort(keys, function(p, q)
+    local ep, eq = p:match("^Enabled") ~= nil, q:match("^Enabled") ~= nil
+    if ep ~= eq then return ep end
+    return p < q
+  end)
+  for _, k in ipairs(keys) do tool:SetInput(k, a.inputs[k]) end
+end
+
+-- Restyle existing Text+ titles without replacing them.
+function OPS.style_text_plus(a)
+  local n = 0
+  for _, id in ipairs(a.item_ids) do apply_text_style(text_tool(find_item(id)), a); n = n + 1 end
+  return { styled = n }
+end
+
+-- Editable Text+ titles. Each spec: {text, record_frame, frames}. Style is optional (font, style, size, x, y).
+-- Reports which length/track calls this Resolve exposes, because they vary by version.
+function OPS.add_text_plus(a)
+  local t = tl()
+  local fps = math.floor(tonumber(t:GetSetting("timelineFrameRate")) or 30)
+  local function tc(f)
+    return string.format("%02d:%02d:%02d:%02d", math.floor(f / (fps * 3600)), math.floor(f / (fps * 60)) % 60,
+                         math.floor(f / fps) % 60, f % fps)
+  end
+  local report = { timeline = {}, item = {} }
+  for _, k in ipairs({ "InsertFusionTitleIntoTimeline", "InsertTitleIntoTimeline", "SetTrackLock", "GetIsTrackLocked",
+                       "SetTrackEnable" }) do report.timeline[k] = type(t[k]) end
+  local locked = {}
+  for _, n in ipairs(a.lock_video_tracks or {}) do
+    if t:SetTrackLock("video", n, true) then locked[#locked + 1] = n end
+  end
+  local out = {}
+  local ok, err = pcall(function()
+    for _, spec in ipairs(a.items) do
+      if not t:SetCurrentTimecode(tc(spec.record_frame)) then error("could not move playhead to " .. tc(spec.record_frame), 0) end
+      local it = t:InsertFusionTitleIntoTimeline("Text+")
+      if not it then error("Resolve refused to insert Text+", 0) end
+      for _, k in ipairs({ "SetStart", "SetEnd", "SetDuration", "SetLeftOffset", "SetRightOffset", "GetFusionCompByIndex" }) do
+        report.item[k] = type(it[k])
+      end
+      local tool = text_tool(it)
+      tool:SetInput("StyledText", spec.text)
+      apply_text_style(tool, a)
+      if a.list_inputs then
+        report.inputs = {}
+        for _, inp in pairs(tool:GetInputList()) do report.inputs[#report.inputs + 1] = inp:GetAttrs().INPS_ID end
+      end
+      local trimmed = "none"
+      if spec.frames then
+        if type(it.SetEnd) == "function" and it:SetEnd(spec.record_frame + spec.frames) then trimmed = "SetEnd"
+        elseif type(it.SetDuration) == "function" and it:SetDuration(spec.frames) then trimmed = "SetDuration" end
+      end
+      local info = item_info(it, "video")
+      info.trimmed = trimmed
+      out[#out + 1] = info
+    end
+  end)
+  for _, n in ipairs(locked) do t:SetTrackLock("video", n, false) end
+  if not ok then error(err, 0) end
+  report.items = out
+  return report
 end
 
 function OPS.add_marker(a)

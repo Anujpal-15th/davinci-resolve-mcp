@@ -93,6 +93,15 @@ r = rpc(5, "tools/call", {"name": "append_clips",
                           "arguments": {"clips": [{"clip": "a.mp4", "start_frame": 10, "end_frame": 50}]}})
 assert not r.get("isError"), r
 assert appended == [(10, 50)], appended
+# end_frame is exclusive; the default full-source range must end at the frame count (240),
+# not frame count - 1.
+r = rpc(10, "tools/call", {"name": "append_clips",
+                           "arguments": {"clips": [{"clip": "a.mp4"}]}})
+assert not r.get("isError"), r
+assert appended[-1] == (0, 240), appended
+r = rpc(11, "tools/call", {"name": "append_clips",
+                           "arguments": {"clips": [{"clip": "a.mp4", "start_frame": 10, "end_frame": 10}]}})
+assert r["isError"] and "exclusive" in text(r), r
 r = rpc(6, "tools/call", {"name": "set_item_properties", "arguments": {"item_id": "x", "properties": {"Evil": 1}}})
 assert r["isError"] and "not allowed" in text(r), r
 r = rpc(8,"tools/call", {"name": "add_marker", "arguments": {"frame": 5}})
