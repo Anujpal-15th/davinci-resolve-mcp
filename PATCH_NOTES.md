@@ -1,5 +1,29 @@
 # Patch notes — DaVinci Resolve MCP
 
+## Stage-two audit (2026-11-11)
+
+Found and fixed, each confirmed in a real Resolve 21.1 (free) on a scratch timeline:
+- Move and trim deleted the clip first and re-added it, losing grade, transform, audio levels and fades, and a failed
+  re-add could lose the clip. They now build the replacement on a temporary track, copy grade (`CopyGrades`),
+  properties, fades, colour, flags and markers, verify, and only then remove the original. Linked audio/video moves
+  with it and is relinked. Keyframes still can't be copied: the API has no way to read them.
+- Speed-changed clips, Fusion clips, take clips, mixed frame rates and clips touching a transition are refused
+  instead of being replaced with the wrong source range.
+- Text+ captions were always 5 s long (the API can't resize titles) and drifted at 29.97/23.976 because the frame
+  rate was rounded down. Captions now use upstream's nested-timeline route for exact frames and lengths; long lines
+  are split and overlaps trimmed. Timecode maths is exact, including drop frame.
+- Timeline reports counted transitions as overlaps and returned every gap; they are now compact with timecodes.
+- Duplicating a timeline makes Resolve switch to the copy, sometimes after the script switched back. Timeline
+  switching is now verified and retried, and every confirmed edit checks the timeline didn't change underneath it.
+- The bridge path in the README didn't work when setup ran inside a sandboxed app; the bridge now also lives in
+  `%USERPROFILE%\resolve-claude-bridge`, and the bridge can reload itself.
+
+Added: previews before destructive edits, `edit__batch`, read caching with invalidation, `place_clips`,
+`inspect_range`, `find_media`, native fades, transitions, speed, audio volume/pan, loudness normalization,
+grade copy, batch markers, timeline export (OTIO/FCPXML/EDL/AAF/DRT), SRT export and file QC.
+Not added because the API can't do it: keyframes, power windows, node creation, subtitle-track placement
+(scripted subtitle import crashes Resolve 21), Fairlight effects and bus routing.
+
 ## Fixed
 - `add_track` now uses an explicit branch. The previous Lua `and/or` idiom could call `AddTrack("video")` when adding an audio track returned false/nil.
 - `append_clips` validates source ranges, track indexes, record positions and media type before calling Resolve.

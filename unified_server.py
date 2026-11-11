@@ -31,11 +31,12 @@ GUARDED_LEGACY = {"delete_items", "start_render"}
 READ_ONLY_LEGACY = {"get_state", "list_timelines", "list_media", "list_timeline_items", "list_markers", "probe_color",
                     "export_frame", "list_render_presets", "render_status", "goto_timecode", "open_page",
                     "set_current_timeline"}
-INSTRUCTIONS = """Controls DaVinci Resolve. On free Resolve use legacy__ and edit__ tools; resolve__ timeline tools need Studio.
-Before editing: run edit__timeline_report, since the user may have edited by hand, and edit__snapshot_timeline.
-Make small targeted changes and never rebuild a whole timeline. Ask before deleting or replacing clips.
-Never render unless the user says to. Do not mix legacy__ and resolve__ edits on one timeline.
-Read resolve__knowledge for editorial, colour and audio guidance. You cannot hear audio: say so rather than implying it."""
+INSTRUCTIONS = """Controls DaVinci Resolve. On free Resolve use edit__ (preferred) and legacy__; resolve__ timeline tools need Studio.
+Start with edit__timeline_summary (the user may have edited by hand), then edit__inspect_range for the part you will change.
+Destructive edit__ tools return a preview first: show it to the user, then repeat with confirm=true. Use edit__batch for
+several changes. Never rebuild a whole timeline, never delete clips without asking, never render unless told to.
+Do not mix legacy__ and resolve__ edits on one timeline. Read resolve__knowledge for editorial, colour and audio craft.
+You cannot hear audio: say so rather than implying it."""
 
 class Child:
     def __init__(self, label: str, command: list[str], cwd: pathlib.Path):
@@ -330,6 +331,7 @@ class Gateway:
             result = response.get("result", {})
             if backend == "legacy" and original not in READ_ONLY_LEGACY:
                 import editor_tools
+                editor_tools.invalidate()
                 editor_tools.log_audit(name, args, "failed" if result.get("isError") else "success")
             return result
         if method in {"resources/list", "resources/read", "prompts/list", "prompts/get"}:

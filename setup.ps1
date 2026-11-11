@@ -72,7 +72,12 @@ if (Test-Path $BridgeTarget) {
   Write-Host "Existing Lua bridge backed up to $Backup"
 }
 Copy-Item (Join-Path $Root "resolve_bridge.lua") $BridgeTarget -Force -ErrorAction Stop
-Write-Host "Lua bridge installed."
+# Also in the bridge folder: the README's Console line loads this copy, and it works even when setup runs inside a
+# sandboxed app whose AppData writes Resolve can't see.
+$BridgeDir = Join-Path $env:USERPROFILE "resolve-claude-bridge"
+New-Item -ItemType Directory -Force -Path $BridgeDir | Out-Null
+Copy-Item (Join-Path $Root "resolve_bridge.lua") (Join-Path $BridgeDir "resolve_bridge.lua") -Force -ErrorAction Stop
+Write-Host "Lua bridge installed to $BridgeDir"
 
 $ServerArgs = @("-X", "utf8", $Gateway)
 if ($Studio) { $ServerArgs += "--upstream-tools=all" }

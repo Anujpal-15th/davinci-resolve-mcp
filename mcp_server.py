@@ -17,8 +17,7 @@ import uuid
 DIR = os.environ.get("RESOLVE_BRIDGE_DIR") or os.path.join(os.path.expanduser("~"), "resolve-claude-bridge")
 os.makedirs(DIR, exist_ok=True)
 NOT_RUNNING = ("Bridge not running. In Resolve open Workspace > Console (Lua tab) and run: "
-               'dofile(os.getenv("APPDATA").."\\\\Blackmagic Design\\\\DaVinci Resolve\\\\Support\\\\Fusion\\\\Scripts'
-               '\\\\Utility\\\\resolve_bridge.lua")')
+               'dofile(os.getenv("USERPROFILE").."\\\\resolve-claude-bridge\\\\resolve_bridge.lua")')
 
 S, I, B = {"type": "string"}, {"type": "integer"}, {"type": "boolean"}
 STRS = {"type": "array", "items": S}

@@ -223,8 +223,10 @@ end
 
 local function item_info(it, kind, track)
   local okl, left = pcall(function() return it:GetLeftOffset() end)
+  local okt, ty = pcall(function() return it:GetType() end)
   return { id = it:GetUniqueId(), name = it:GetName(), start = it:GetStart(), ["end"] = it:GetEnd(),
-           duration = it:GetDuration(), source_start = okl and left or nil, track_type = kind, track = track }
+           duration = it:GetDuration(), source_start = okl and left or nil, type = okt and ty or nil,
+           track_type = kind, track = track }
 end
 
 local function items(kind)
@@ -246,7 +248,9 @@ end
 
 local PROPS = {}
 for _, k in ipairs({ "Pan", "Tilt", "ZoomX", "ZoomY", "ZoomGang", "Opacity", "RotationAngle", "Pitch", "Yaw",
-  "CropLeft", "CropRight", "CropTop", "CropBottom", "FlipX", "FlipY", "CompositeMode", "RetimeProcess" }) do
+  "CropLeft", "CropRight", "CropTop", "CropBottom", "CropSoftness", "CropRetain", "FlipX", "FlipY", "CompositeMode",
+  "RetimeProcess", "MotionEstimation", "AnchorPointX", "AnchorPointY", "Distortion", "DynamicZoomEase", "Scaling", "ResizeFilter",
+  "AudioVolume", "AudioPan", "AudioPitchSemiTones", "AudioPitchCents" }) do
   PROPS[k] = true
 end
 local PAGES = { media = true, cut = true, edit = true, fusion = true, color = true, fairlight = true, deliver = true }
@@ -259,6 +263,7 @@ function OPS.get_state()
   local t = p and p:GetCurrentTimeline()
   return { resolve = resolve:GetVersionString(), page = resolve:GetCurrentPage(), project = p and p:GetName(),
            timeline = t and t:GetName(), timeline_fps = t and t:GetSetting("timelineFrameRate"),
+           timeline_drop_frame = t and t:GetSetting("timelineDropFrameTimecode"),
            timeline_start_frame = t and t:GetStartFrame(), timeline_end_frame = t and t:GetEndFrame(),
            current_timecode = t and t:GetCurrentTimecode() }
 end
@@ -273,7 +278,15 @@ function OPS.set_current_timeline(a)
   local p = proj()
   for i = 1, p:GetTimelineCount() do
     local t = p:GetTimelineByIndex(i)
-    if t:GetName() == a.name then return { ok = p:SetCurrentTimeline(t) and true or false } end
+    if t:GetName() == a.name then
+      -- Resolve can switch timelines again a moment later (e.g. after DuplicateTimeline), so check it stuck.
+      for _ = 1, 6 do
+        p:SetCurrentTimeline(t)
+        sleep(0.3)
+        if p:GetCurrentTimeline():GetName() == a.name then return { ok = true } end
+      end
+      error("Resolve did not stay on timeline " .. a.name, 0)
+    end
   end
   error("timeline not found: " .. tostring(a.name), 0)
 end
@@ -486,7 +499,8 @@ end
 -- Reports which length/track calls this Resolve exposes, because they vary by version.
 function OPS.add_text_plus(a)
   local t = tl()
-  local fps = math.floor(tonumber(t:GetSetting("timelineFrameRate")) or 30)
+  -- Timecode counts nominal frames, so 29.97 is base 30 and 23.976 is base 24. Python sends exact timecodes.
+  local fps = math.floor((tonumber(tostring(t:GetSetting("timelineFrameRate")):match("[%d%.]+")) or 30) + 0.5)
   local function tc(f)
     return string.format("%02d:%02d:%02d:%02d", math.floor(f / (fps * 3600)), math.floor(f / (fps * 60)) % 60,
                          math.floor(f / fps) % 60, f % fps)
@@ -501,7 +515,8 @@ function OPS.add_text_plus(a)
   local out = {}
   local ok, err = pcall(function()
     for _, spec in ipairs(a.items) do
-      if not t:SetCurrentTimecode(tc(spec.record_frame)) then error("could not move playhead to " .. tc(spec.record_frame), 0) end
+      local at = spec.timecode or tc(spec.record_frame)
+      if not t:SetCurrentTimecode(at) then error("could not move playhead to " .. at, 0) end
       local it = t:InsertFusionTitleIntoTimeline("Text+")
       if not it then error("Resolve refused to insert Text+", 0) end
       for _, k in ipairs({ "SetStart", "SetEnd", "SetDuration", "SetLeftOffset", "SetRightOffset", "GetFusionCompByIndex" }) do
@@ -587,6 +602,256 @@ function OPS.render_status()
 end
 
 -- ---------- loop ----------
+-- ---------- clip settings, native 21.1 operations, batching ----------
+local unpack = unpack or table.unpack
+local reload_requested = false
+local BRIDGE_FILE = (os.getenv("APPDATA") or "") .. "\\Blackmagic Design\\DaVinci Resolve\\Support\\Fusion\\Scripts\\Utility\\resolve_bridge.lua"
+
+-- Call a method that may not exist on this Resolve build. Never use this for Studio-gated calls: on free
+-- they raise a modal dialog that blocks every later API call.
+local function try(obj, name, ...)
+  local args, n = { ... }, select("#", ...)
+  local ok, r = pcall(function() return obj[name](obj, unpack(args, 1, n)) end)
+  if ok then return r end
+  return nil
+end
+
+function OPS.probe_api(a)
+  local t = tl()
+  local it = a.item_id and find_item(a.item_id)
+  if not it then for _, x in ipairs(items("video")) do it = x[1]; break end end
+  local out = { timeline = {}, item = {}, resolve = {} }
+  for _, k in ipairs({ "NoSuchMethodXYZ", "DeleteTrack", "SetClipsLinked", "NormalizeAudioLevel", "GetNormalizeAudioModes",
+                       "Export", "GetSelectedClips", "GetIsTrackLocked", "InsertFusionTitleIntoTimeline" }) do
+    out.timeline[k] = type(t[k])
+  end
+  if it then
+    for _, k in ipairs({ "NoSuchMethodXYZ", "GetProperty", "SetProperty", "GetSpeed", "SetSpeed", "GetFades", "SetFades",
+                         "AddTransition", "GetType", "CopyGrades", "GetLinkedItems", "GetSourceStartFrame", "GetSourceEndFrame",
+                         "SetClipEnabled", "GetClipEnabled", "GetFlagList", "AddFlag", "SetClipColor", "GetClipColor",
+                         "GetFusionCompCount", "GetTakesCount", "SetStart", "SetEnd", "SetDuration", "SetLeftOffset",
+                         "SetRightOffset", "GetMarkers", "AddMarker" }) do
+      out.item[k] = type(it[k])
+    end
+  end
+  for _, k in ipairs({ "IsStudio", "GetProductName", "GetCurrentPage" }) do out.resolve[k] = type(resolve[k]) end
+  out.product = try(resolve, "GetProductName")
+  return out
+end
+
+local function item_detail(it)
+  local mp = try(it, "GetMediaPoolItem")
+  local linked = {}
+  for _, l in ipairs(each(try(it, "GetLinkedItems"))) do linked[#linked + 1] = l:GetUniqueId() end
+  return { id = it:GetUniqueId(), name = it:GetName(), type = try(it, "GetType"), media_id = mp and try(mp, "GetMediaId"),
+           properties = try(it, "GetProperty"), speed = try(it, "GetSpeed"), fades = try(it, "GetFades"),
+           enabled = try(it, "GetClipEnabled"), color = try(it, "GetClipColor"), flags = each(try(it, "GetFlagList")),
+           markers = try(it, "GetMarkers"), fusion_comps = try(it, "GetFusionCompCount"), takes = try(it, "GetTakesCount"),
+           source_start = try(it, "GetSourceStartFrame"), source_end = try(it, "GetSourceEndFrame"), linked = linked }
+end
+
+function OPS.item_details(a)
+  local out = {}
+  for _, id in ipairs(a.item_ids) do out[#out + 1] = item_detail(find_item(id)) end
+  return out
+end
+
+-- Copy everything the API can read from one item to another, then read it back.
+function OPS.copy_settings(a)
+  local src, dst = find_item(a.from_id), find_item(a.to_id)
+  local copied, failed = {}, {}
+  local function mark(name, ok) if ok then copied[#copied + 1] = name else failed[#failed + 1] = name end end
+  if a.kind == "video" then mark("grade", try(src, "CopyGrades", { dst })) end
+  for k, v in pairs(try(src, "GetProperty") or {}) do
+    if type(v) == "number" or type(v) == "boolean" then
+      if try(dst, "GetProperty", k) ~= v then
+        try(dst, "SetProperty", k, v)
+        mark("property:" .. k, try(dst, "GetProperty", k) == v)
+      end
+    end
+  end
+  local fades = try(src, "GetFades")
+  if type(fades) == "table" and ((tonumber(fades.FadeIn) or 0) > 0 or (tonumber(fades.FadeOut) or 0) > 0) then
+    mark("fades", try(dst, "SetFades", { FadeIn = math.floor(tonumber(fades.FadeIn) or 0), FadeOut = math.floor(tonumber(fades.FadeOut) or 0) }))
+  end
+  local enabled = try(src, "GetClipEnabled")
+  if enabled == false then mark("disabled", try(dst, "SetClipEnabled", false)) end
+  local color = try(src, "GetClipColor")
+  if type(color) == "string" and color ~= "" then mark("clip_color", try(dst, "SetClipColor", color)) end
+  for _, f in ipairs(each(try(src, "GetFlagList"))) do mark("flag", try(dst, "AddFlag", f)) end
+  local shift, duration = a.marker_shift or 0, dst:GetDuration()
+  for frame, m in pairs(try(src, "GetMarkers") or {}) do
+    local f = (tonumber(frame) or -1) + shift
+    if type(m) == "table" and f >= 0 and f < duration then
+      mark("marker", try(dst, "AddMarker", f, m.color, m.name or "", m.note or "", m.duration or 1, m.customData or ""))
+    end
+  end
+  return { copied = copied, failed = failed }
+end
+
+function OPS.link_items(a)
+  local list = {}
+  for _, id in ipairs(a.item_ids) do list[#list + 1] = find_item(id) end
+  return { ok = tl():SetClipsLinked(list, true) and true or false }
+end
+
+-- Only removes the last track, and only when it is empty.
+function OPS.delete_empty_track(a)
+  local t = tl()
+  if a.track ~= t:GetTrackCount(a.track_type) then error("only the last track can be removed", 0) end
+  if #each(t:GetItemListInTrack(a.track_type, a.track)) > 0 then error("track is not empty", 0) end
+  return { ok = t:DeleteTrack(a.track_type, a.track) and true or false }
+end
+
+function OPS.set_fades(a)
+  local it = find_item(a.item_id)
+  local ok = it:SetFades({ FadeIn = a.fade_in or 0, FadeOut = a.fade_out or 0 })
+  return { ok = ok and true or false, fades = try(it, "GetFades") }
+end
+
+function OPS.set_speed(a)
+  local it = find_item(a.item_id)
+  local ok = it:SetSpeed({ Percentage = a.percentage, RippleTimeline = a.ripple or false })
+  return { ok = ok and true or false, speed = try(it, "GetSpeed") }
+end
+
+function OPS.add_transition(a)
+  local tr = find_item(a.item_id):AddTransition(a.options)
+  if not tr then error("Resolve refused the transition (the clips may have no spare source frames)", 0) end
+  return { id = tr:GetUniqueId(), name = tr:GetName(), start = tr:GetStart(), ["end"] = tr:GetEnd(), duration = tr:GetDuration() }
+end
+
+function OPS.set_enabled(a)
+  local n = 0
+  for _, id in ipairs(a.item_ids) do if find_item(id):SetClipEnabled(a.enabled) then n = n + 1 end end
+  return { changed = n }
+end
+
+function OPS.review_item(a)
+  local it, out = find_item(a.item_id), {}
+  if a.color then out.color = it:SetClipColor(a.color) and true or false end
+  if a.flag then out.flag = it:AddFlag(a.flag) and true or false end
+  return out
+end
+
+function OPS.copy_grade(a)
+  local list = {}
+  for _, id in ipairs(a.to_ids) do list[#list + 1] = find_item(id) end
+  return { ok = find_item(a.from_id):CopyGrades(list) and true or false }
+end
+
+function OPS.audio_modes() return tl():GetNormalizeAudioModes() or {} end
+
+function OPS.normalize_audio(a)
+  local list, options = {}, {}
+  for _, id in ipairs(a.item_ids) do list[#list + 1] = find_item(id) end
+  for k, v in pairs(a.options or {}) do options[k] = v end
+  if type(options.setLevelMode) == "string" then options.setLevelMode = resolve[options.setLevelMode] end
+  return { ok = tl():NormalizeAudioLevel(list, options) and true or false }
+end
+
+function OPS.add_markers(a)
+  local t, n = tl(), 0
+  for _, m in ipairs(a.markers) do
+    if t:AddMarker(m.frame, m.color or "Blue", m.name or "", m.note or "", m.duration or 1, "") then n = n + 1 end
+  end
+  return { added = n }
+end
+
+local EXPORTS = { OTIO = "EXPORT_OTIO", FCPXML = "EXPORT_FCPXML_1_10", EDL = "EXPORT_EDL", AAF = "EXPORT_AAF", DRT = "EXPORT_DRT" }
+function OPS.export_timeline(a)
+  local kind = EXPORTS[a.format]
+  if not kind then error("unknown format: " .. tostring(a.format), 0) end
+  local subtype = (a.format == "AAF") and resolve.EXPORT_AAF_NEW or ((a.format == "EDL") and resolve.EXPORT_NONE or nil)
+  local ok
+  if subtype ~= nil then ok = tl():Export(a.path, resolve[kind], subtype) else ok = tl():Export(a.path, resolve[kind]) end
+  return { ok = ok and true or false }
+end
+
+-- Clean-up for automated tests: only names carrying the test prefix can be removed.
+function OPS.delete_scratch(a)
+  local p, out = proj(), {}
+  if a.timeline then
+    if a.timeline:sub(1, 5) ~= "_RCE_" then error("scratch timelines must start with _RCE_", 0) end
+    if p:GetCurrentTimeline():GetName() == a.timeline then error("switch away from the scratch timeline first", 0) end
+    for i = 1, p:GetTimelineCount() do
+      local t = p:GetTimelineByIndex(i)
+      if t:GetName() == a.timeline then out.timeline = pool():DeleteTimelines({ t }) and true or false; break end
+    end
+  end
+  if a.folder then
+    if a.folder:sub(1, 5) ~= "_RCE_" then error("scratch bins must start with _RCE_", 0) end
+    for _, f in ipairs(each(pool():GetRootFolder():GetSubFolderList())) do
+      if f:GetName() == a.folder then
+        local tls = {}
+        for _, c in ipairs(each(f:GetClipList())) do
+          local inner = try(c, "GetTimeline")
+          if inner then tls[#tls + 1] = inner end
+        end
+        out.timelines = (#tls == 0 or pool():DeleteTimelines(tls)) and #tls or false
+        out.folder = pool():DeleteFolders({ f }) and true or false
+      end
+    end
+  end
+  if a.clip then
+    if a.clip:sub(1, 4) ~= "rce_" then error("scratch clips must start with rce_", 0) end
+    out.clip = pool():DeleteClips({ find_clip(a.clip) }) and true or false
+  end
+  return out
+end
+
+-- Text+ titles can't be resized or moved by script, so each card lives on its own small timeline in a bin and
+-- that timeline is placed like a clip: exact frame, exact length, chosen track (upstream issue #74 route).
+function OPS.add_title_cards(a)
+  local p, mp, target = proj(), pool(), tl()
+  local root, folder = mp:GetRootFolder(), nil
+  for _, f in ipairs(each(root:GetSubFolderList())) do if f:GetName() == a.folder then folder = f end end
+  folder = folder or mp:AddSubFolder(root, a.folder)
+  if not folder then error("could not create bin " .. tostring(a.folder), 0) end
+  local previous = mp:GetCurrentFolder()
+  mp:SetCurrentFolder(folder)
+  local out = {}
+  local ok, err = pcall(function()
+    for i, c in ipairs(a.cards) do
+      local inner = mp:CreateEmptyTimeline(c.name)
+      if not inner then error("could not create timeline " .. c.name, 0) end
+      p:SetCurrentTimeline(inner)
+      local title = inner:InsertFusionTitleIntoTimeline("Text+")
+      if not title then error("Text+ insert failed", 0) end
+      local tool = text_tool(title)
+      tool:SetInput("StyledText", c.text)
+      apply_text_style(tool, a)
+      local item = try(inner, "GetMediaPoolItem")
+      p:SetCurrentTimeline(target)
+      if not item then error("this Resolve build gives timelines no media pool item", 0) end
+      local placed = each(mp:AppendToTimeline({ { mediaPoolItem = item, startFrame = 0, endFrame = c.frames,
+                                                   trackIndex = a.track_index, recordFrame = c.record_frame, mediaType = 1 } }))
+      if not placed[1] then error("Resolve refused to place card " .. i .. " (track busy at that frame?)", 0) end
+      out[#out + 1] = item_info(placed[1], "video", a.track_index)
+    end
+  end)
+  p:SetCurrentTimeline(target)
+  mp:SetCurrentFolder(previous)
+  if not ok then return { placed = out, error = tostring(err) } end
+  return { placed = out }
+end
+
+function OPS.reload_bridge()
+  reload_requested = true
+  return { ok = true }
+end
+
+function OPS.batch(a)
+  local out = {}
+  for i, call in ipairs(a.calls) do
+    if call.op == "batch" or call.op == "reload_bridge" or not OPS[call.op] then error("op not allowed in batch: " .. tostring(call.op), 0) end
+    local ok, r = pcall(OPS[call.op], call.args or {})
+    out[i] = { ok = ok, result = ok and r or nil, error = (not ok) and tostring(r) or nil }
+    if not ok then break end
+  end
+  return out
+end
+
 -- No delete/rename here: requests carry an id and we answer each id once. mcp_server.py deletes old files.
 local me = tostring({}):gsub("table: ", "")  -- unique per run
 fu:SetData("claude_bridge_inst", me)  -- in-memory; a newer run overwrites it and this loop exits
@@ -609,6 +874,12 @@ while fu:GetData("claude_bridge_inst") == me do
     end)
     if not good then out = { id = id, ok = false, error = tostring(out) } end
     reply(id, json.encode(out))
+    if reload_requested then
+      -- A copy in the bridge folder wins: apps sandboxed by Windows can't write to the real AppData.
+      local staged = loadfile(DIR .. "resolve_bridge.lua")
+      if staged then return staged() end
+      return dofile(BRIDGE_FILE)
+    end
   else
     sleep(0.1)
   end

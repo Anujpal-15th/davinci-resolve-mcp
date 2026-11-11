@@ -9,6 +9,15 @@
 - On free Resolve only `resolve__knowledge`, `resolve__media_analysis` and `resolve__setup` are exposed.
 - Never mix `resolve__` and `legacy__` timeline mutations in one operation.
 
+## Using the tools efficiently
+- Start with `edit__timeline_summary`, then `edit__inspect_range` for just the part you will change. Don't list whole
+  timelines repeatedly; reads are cached for a few seconds and every write clears the cache.
+- Destructive `edit__` tools return a preview first. Show it, then repeat with `confirm=true`.
+- Group several changes with `edit__batch` (one backup, stops at the first failure).
+- Prefer `edit__set_enabled` (reversible) over deleting clips.
+- Move and trim copy grade, transform, audio levels, fades, colour, flags and markers, but not keyframes.
+- Never call Studio-only features on free Resolve: they open a dialog that blocks every later call.
+
 ## Editing workflow
 1. Inspect Resolve version, project, timeline, frame rate, and media inventory.
 2. Inspect existing analysis before repeating work.
