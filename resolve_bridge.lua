@@ -1,14 +1,19 @@
 -- resolve_bridge.lua: runs INSIDE DaVinci Resolve. Start it from Workspace > Console (Lua tab) with
---   dofile(os.getenv("APPDATA").."\\Blackmagic Design\\DaVinci Resolve\\Support\\Fusion\\Scripts\\Utility\\resolve_bridge.lua")
--- mcp_server.py writes request.lua (`return [==[<json>]==]`) into %USERPROFILE%\resolve-claude-bridge\;
+--   Resolve 21.2 and newer:  fusion:RunScript(os.getenv("USERPROFILE").."\\resolve-claude-bridge\\resolve_bridge.lua")
+--   Resolve 21.1 and older:  dofile(os.getenv("USERPROFILE").."\\resolve-claude-bridge\\resolve_bridge.lua")
+-- mcp_server.py writes request.lua into %USERPROFILE%\resolve-claude-bridge\;
 -- this loop runs it against a fixed allowlist of Resolve operations.
 -- No arbitrary code execution. Run it again to restart; the old loop stops by itself.
 --
--- Resolve's Lua has no io and no file-writing call (bmd.writestring only serialises). The only reader is
--- loadfile, and the only writer is fusion:SetData + fusion:SavePrefs(), which writes Fusion.prefs.
--- So the reply is stored as `claude_bridge_res = "<id>:<hex json>"` in Fusion.prefs and mcp_server.py reads it.
+-- Two transports, picked at run time from what this Resolve build still allows:
+-- * 21.1 and older: requests are read with loadfile; the reply is stored as
+--   `claude_bridge_res = "<id>:<hex json>"` via fusion:SetData + fusion:SavePrefs() in Fusion.prefs.
+-- * 21.2 (free) removed loadfile, dofile, io and fusion:SavePrefs. Requests are read with fusion:RunScript
+--   (request.lua stores its JSON with fusion:SetData), and the reply is written into the Comments metadata
+--   of a 16x16 token clip in a "Claude Bridge" media-pool bin, then exported with MediaPool:ExportMetadata
+--   to reply.csv, which mcp_server.py reads. The token clip is the only thing this transport changes.
 -- An empty payload ("<id>:") is the ack that tells mcp_server.py the bridge is alive.
--- ponytail: rewrites Fusion.prefs twice per request; fine for interactive use, not for high call rates.
+-- ponytail: writes the reply file twice per request; fine for interactive use, not for high call rates.
 
 -- Not under AppData: the Claude desktop app is MSIX-packaged, so its writes to AppData\Local get redirected
 -- into its private package folder where Resolve cannot see them.
@@ -16,21 +21,73 @@ local DIR = BRIDGE_DIR or (os.getenv("USERPROFILE") .. "\\resolve-claude-bridge\
 local REQ = DIR .. "request.lua"
 local fu = fusion or fu or (resolve or Resolve()):Fusion()
 
+local REPLY_CSV = DIR .. "reply.csv"
+local TOKEN_FILE = DIR .. "bridge_token.png"  -- written by mcp_server.py; Lua here cannot write files
+local TOKEN_BIN = "Claude Bridge"
+local USE_PREFS = fu.SavePrefs ~= nil  -- 21.1 and older
+
+local function log(msg) print("resolve_bridge: " .. tostring(msg)) end
+
 local function readreq()
-  local chunk = loadfile(REQ)  -- nil when missing
-  if not chunk then return nil end
-  local ok, s = pcall(chunk)
-  if ok and type(s) == "string" and s ~= "" then return s end
+  if loadfile then  -- 21.1 and older
+    local chunk = loadfile(REQ)  -- nil when missing
+    if not chunk then return nil end
+    local ok, s = pcall(chunk)
+    if ok and type(s) == "string" and s ~= "" then return s end
+    return nil
+  end
+  -- 21.2+: run request.lua, which hands its JSON over with fusion:SetData. Ids filter out stale values.
+  if bmd and bmd.fileexists then
+    local ok, exists = pcall(bmd.fileexists, REQ)
+    if ok and not exists then return nil end
+  end
+  pcall(fu.RunScript, fu, REQ)
+  local s = fu:GetData("claude_bridge_req")
+  if type(s) == "string" and s ~= "" then return s end
   return nil
+end
+
+-- 21.2+: find or create the token clip that carries replies.
+local function token_clip()
+  local res = resolve or Resolve()
+  local proj = res and res:GetProjectManager():GetCurrentProject()
+  if not proj then return nil, nil, "no project is open in Resolve" end
+  local mp = proj:GetMediaPool()
+  local root = mp:GetRootFolder()
+  local bin
+  for _, f in ipairs(root:GetSubFolderList() or {}) do
+    if f:GetName() == TOKEN_BIN then bin = f break end
+  end
+  local prev = mp:GetCurrentFolder()
+  if not bin then bin = mp:AddSubFolder(root, TOKEN_BIN) end
+  if not bin then return nil, nil, "could not create the '" .. TOKEN_BIN .. "' bin" end
+  local clip = (bin:GetClipList() or {})[1]
+  if not clip then
+    mp:SetCurrentFolder(bin)
+    local got = mp:ImportMedia({ TOKEN_FILE })
+    clip = got and got[1]
+  end
+  if prev then mp:SetCurrentFolder(prev) end
+  if not clip then return nil, nil, "could not import " .. TOKEN_FILE end
+  return mp, clip
 end
 
 local function hex(s) return (s:gsub(".", function(c) return string.format("%02x", c:byte()) end)) end
 local function reply(id, payload)
-  fu:SetData("claude_bridge_res", id .. ":" .. (payload and hex(payload) or ""))
-  fu:SavePrefs()
+  local value = id .. ":" .. (payload and hex(payload) or "")
+  if USE_PREFS then
+    fu:SetData("claude_bridge_res", value)
+    fu:SavePrefs()
+    return
+  end
+  local ok, err = pcall(function()
+    local mp, clip, why = token_clip()
+    if not clip then error(why, 0) end
+    if not clip:SetMetadata("Comments", value) then error("could not write the reply into the token clip", 0) end
+    if not mp:ExportMetadata(REPLY_CSV, { clip }) then error("could not export " .. REPLY_CSV, 0) end
+  end)
+  if not ok then log("reply failed: " .. tostring(err)) end
 end
-
-local function log(msg) print("resolve_bridge: " .. tostring(msg)) end
 
 local function main()
 log("starting")
@@ -199,7 +256,9 @@ local function all_clips(folder, out)
   out = out or {}
   folder = folder or pool():GetRootFolder()
   for _, c in ipairs(each(folder:GetClipList())) do out[#out + 1] = c end
-  for _, f in ipairs(each(folder:GetSubFolderList())) do all_clips(f, out) end
+  for _, f in ipairs(each(folder:GetSubFolderList())) do
+    if f:GetName() ~= TOKEN_BIN then all_clips(f, out) end  -- skip the bridge's own token clip
+  end
   return out
 end
 
@@ -857,7 +916,7 @@ local me = tostring({}):gsub("table: ", "")  -- unique per run
 fu:SetData("claude_bridge_inst", me)  -- in-memory; a newer run overwrites it and this loop exits
 local function req_id(raw) return raw and raw:match('"id"%s*:%s*"([^"]*)"') end
 local last = req_id(readreq())  -- ignore a stale request left from before this run
-log("running. Folder: " .. DIR)
+log("running (" .. (USE_PREFS and "Fusion.prefs" or "RunScript + token clip") .. " transport). Folder: " .. DIR)
 
 while fu:GetData("claude_bridge_inst") == me do
   local raw = readreq()
@@ -875,6 +934,10 @@ while fu:GetData("claude_bridge_inst") == me do
     if not good then out = { id = id, ok = false, error = tostring(out) } end
     reply(id, json.encode(out))
     if reload_requested then
+      if not loadfile then  -- 21.2+: start the new copy; it takes over and this loop exits
+        fu:RunScript(DIR .. "resolve_bridge.lua")
+        return
+      end
       -- A copy in the bridge folder wins: apps sandboxed by Windows can't write to the real AppData.
       local staged = loadfile(DIR .. "resolve_bridge.lua")
       if staged then return staged() end

@@ -1,8 +1,10 @@
 """MCP server (stdio, stdlib only) that forwards tool calls to resolve_bridge.lua running inside Resolve.
 
-Transport: request.lua in %USERPROFILE%\\resolve-claude-bridge; replies come back through Fusion.prefs.
+Transport: request.lua in %USERPROFILE%\\resolve-claude-bridge. Replies come back through Fusion.prefs
+(Resolve 21.1 and older) or through reply.csv, a metadata export of the bridge's token clip (Resolve 21.2+).
 """
 import base64
+import csv
 import json
 import os
 import re
@@ -11,13 +13,16 @@ import subprocess
 import sys
 import time
 import uuid
+import struct
+import zlib
 
 # Not under AppData: the Claude desktop app is MSIX-packaged and its AppData\Local writes are redirected
 # into its private package folder, invisible to Resolve.
 DIR = os.environ.get("RESOLVE_BRIDGE_DIR") or os.path.join(os.path.expanduser("~"), "resolve-claude-bridge")
 os.makedirs(DIR, exist_ok=True)
-NOT_RUNNING = ("Bridge not running. In Resolve open Workspace > Console (Lua tab) and run: "
-               'dofile(os.getenv("USERPROFILE").."\\\\resolve-claude-bridge\\\\resolve_bridge.lua")')
+NOT_RUNNING = ("Bridge not running. In Resolve open Workspace > Console (Lua tab) and run "
+               '(Resolve 21.2+): fusion:RunScript(os.getenv("USERPROFILE").."\\\\resolve-claude-bridge\\\\resolve_bridge.lua") '
+               '(Resolve 21.1 and older): dofile(os.getenv("USERPROFILE").."\\\\resolve-claude-bridge\\\\resolve_bridge.lua")')
 
 S, I, B = {"type": "string"}, {"type": "integer"}, {"type": "boolean"}
 STRS = {"type": "array", "items": S}
@@ -108,15 +113,58 @@ PREFS = os.environ.get("RESOLVE_FUSION_PREFS") or os.path.join(
     os.environ.get("APPDATA", ""), "Blackmagic Design", "DaVinci Resolve", "Support", "Fusion", "Profiles",
     "Default", "Fusion.prefs")
 RES_RE = re.compile(r'claude_bridge_res\s*=\s*"([0-9a-f]*):([0-9a-f]*)"')
+# Resolve 21.2+ (no SavePrefs): the bridge writes the reply into its token clip's Comments metadata and
+# exports it here with MediaPool:ExportMetadata (UTF-16 CSV).
+REPLY_CSV = os.path.join(DIR, "reply.csv")
+TOKEN_PNG = os.path.join(DIR, "bridge_token.png")
+VALUE_RE = re.compile(r"([0-9a-f]*):([0-9a-f]*)")
 
 
-def read_reply():
+def _read_prefs_reply():
     try:
         with open(PREFS, encoding="utf-8", errors="replace") as f:
             m = RES_RE.search(f.read())
         return (m.group(1), m.group(2)) if m else (None, None)
     except OSError:  # being rewritten
         return None, None
+
+
+def _read_csv_reply():
+    try:
+        with open(REPLY_CSV, encoding="utf-16", newline="") as f:
+            rows = list(csv.DictReader(f))
+    except (OSError, UnicodeError, csv.Error):  # missing, or caught mid-write
+        return None, None
+    for row in rows:
+        m = VALUE_RE.fullmatch((row.get("Comments") or "").strip())
+        if m:
+            return m.group(1), m.group(2)
+    return None, None
+
+
+def read_reply(want=None):
+    """Latest reply from either transport; with `want`, only a reply for that request id."""
+    for reader in (_read_csv_reply, _read_prefs_reply):
+        got, payload = reader()
+        if got is not None and (want is None or got == want):
+            return got, payload
+    return None, None
+
+
+def ensure_token_png():
+    """The 21.2+ bridge imports this 16x16 black PNG as its reply carrier; Resolve's Lua cannot create it."""
+    if os.path.isfile(TOKEN_PNG):
+        return
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    raw = b"".join(b"\x00" + b"\x00\x00\x00" * 16 for _ in range(16))
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 16, 16, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+    with open(TOKEN_PNG + ".tmp", "wb") as f:
+        f.write(png)
+    os.replace(TOKEN_PNG + ".tmp", TOKEN_PNG)
 
 
 def lua_long_string(s):
@@ -129,13 +177,19 @@ def lua_long_string(s):
 def call_bridge(op, args, timeout=120, ack_timeout=15):  # Resolve can stall a few seconds (e.g. LUT rescans)
     req_path = os.path.join(DIR, "request.lua")
     rid = uuid.uuid4().hex
+    ensure_token_png()
+    body = lua_long_string(json.dumps({"id": rid, "op": op, "args": args}, ensure_ascii=False))
+    # 21.1 and older load this with loadfile and use the returned string; 21.2+ runs it with
+    # fusion:RunScript, which cannot return values, so it also hands the JSON over with fusion:SetData.
     with open(req_path + ".tmp", "w", encoding="utf-8") as f:
-        f.write("return " + lua_long_string(json.dumps({"id": rid, "op": op, "args": args}, ensure_ascii=False)))
+        f.write("local s = " + body + "\n"
+                "if fusion and fusion.SetData then fusion:SetData(\"claude_bridge_req\", s) end\n"
+                "return s\n")
     os.replace(req_path + ".tmp", req_path)
     try:
         start, acked = time.time(), False
         while time.time() - start < timeout:
-            got, payload = read_reply()
+            got, payload = read_reply(rid)
             if got == rid:
                 if payload:
                     try:
