@@ -81,13 +81,25 @@ Do this **each time you open Resolve**:
 
 1. Open a project in Resolve.
 2. Open **Workspace > Console** and choose the **Lua** tab.
-3. Paste this line and press Enter:
+3. Paste the line for your Resolve version and press Enter.
+
+Resolve 21.2 and newer (`dofile` and `loadfile` were removed from the free edition's Lua):
+
+```lua
+fusion:RunScript(os.getenv("USERPROFILE").."\\resolve-claude-bridge\\resolve_bridge.lua")
+```
+
+Resolve 21.1 and older:
 
 ```lua
 dofile(os.getenv("USERPROFILE").."\\resolve-claude-bridge\\resolve_bridge.lua")
 ```
 
 You should see `resolve_bridge: running`. Leave Resolve open. Running the line again restarts the bridge.
+
+On 21.2 and newer the bridge also adds a **Claude Bridge** bin with a 16×16 `bridge_token.png` clip to the open
+project. Replies travel through that clip's Comments metadata, because 21.2 has no other way to write a file.
+Leave the bin in place while you work; it is skipped by the media tools and you can delete it afterwards.
 
 ### 4. Try it
 
@@ -174,6 +186,8 @@ Resolve's behaviour.
 | `SCRIPTING_UNAVAILABLE` from `resolve__` tools | On free, use `edit__` tools. On Studio, set External scripting to Local and restart Resolve. |
 | `resolve_bridge` does nothing from the Scripts menu | Use the Console line in step 3. |
 | `dofile` says the file isn't found | Run `.\setup.ps1` again from a normal PowerShell window. |
+| `attempt to call global 'dofile' (a nil value)` | You are on Resolve 21.2 or newer. Use the `fusion:RunScript(...)` line in step 3. |
+| `reply failed: no project is open in Resolve` | Open a project; on 21.2+ replies need the project's **Claude Bridge** bin. |
 | `Run setup.ps1 first` | Run `python unified_server.py --doctor`; all `_exists` values should be `true`. |
 | `ffprobe was not found` | Install FFmpeg, add it to PATH, restart your client. |
 | A move or trim is refused | Read the reason: speed changes, Fusion clips, transitions and mixed frame rates are refused on purpose. |
